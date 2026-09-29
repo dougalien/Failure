@@ -39,6 +39,8 @@ import random
 import re
 import sys
 import time
+import zipfile
+from io import BytesIO
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -940,6 +942,20 @@ def run_one(backend: Backend, task: Task, item: Item, condition: str) -> dict:
     }
 
 
+def _new_run_dir(out_dir: Path, base: str) -> Path:
+    """Create a fresh, never-reused run folder (adds -2, -3 ... if the name exists)."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    k = 1
+    while True:
+        d = out_dir / (base if k == 1 else f"{base}-{k}")
+        try:
+            d.mkdir()
+            return d
+        except FileExistsError:
+            k += 1
+
+
 def _slug(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-")[:40] or "model"
 
@@ -971,6 +987,9 @@ def run_experiment(backend: Backend, task_ids: list[str], n: int, seed: int,
     if resume_dir:
         run_dir = Path(resume_dir)
         meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+        if meta.get("combined"):
+            raise ValueError("A combined run can't be resumed. Resume the original run, "
+                             "then combine again.")
         if (meta["backend"], meta["model"]) != (backend.kind, backend.model):
             raise ValueError(f"Run was made with {meta['backend']}/{meta['model']}; "
                              f"select that backend and model to resume it.")
@@ -979,10 +998,9 @@ def run_experiment(backend: Backend, task_ids: list[str], n: int, seed: int,
         meta.setdefault("resumed_utc", []).append(
             dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"))
     else:
-        run_id = (f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}_{backend.kind}_"
-                  f"{_slug(backend.model)}")
-        run_dir = Path(out_dir) / run_id
-        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = _new_run_dir(out_dir, f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}_"
+                                        f"{backend.kind}_{_slug(backend.model)}")
+        run_id = run_dir.name
         meta = {
             "run_id": run_id, "app_version": APP_VERSION, "backend": backend.kind,
             "model": backend.model, "host": backend.host,
@@ -1034,6 +1052,118 @@ def run_experiment(backend: Backend, task_ids: list[str], n: int, seed: int,
     meta["calls_planned"] = total
     meta["finished_utc"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     meta["temperature_dropped"] = backend.temperature_dropped
+    (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return run_dir
+
+
+# ---- saving, importing and combining runs -------------------------------- #
+
+# Settings that must match for runs to be pooled into one data set.
+COMBINE_KEYS = ("backend", "model", "temperature", "seed", "simulated",
+                "opt_system_prompt", "format_lines", "confident_threshold")
+
+
+def planned_calls(meta: dict) -> int:
+    if meta.get("n_by_task"):
+        return sum(int(v) * len(CONDITIONS) for v in meta["n_by_task"].values())
+    return len(meta["tasks"]) * int(meta["n_per_task"]) * len(CONDITIONS)
+
+
+def run_zip_bytes(run_dir: Path) -> bytes:
+    """Whole run folder as a .zip (raw data, meta, tables, figures)."""
+    run_dir = Path(run_dir)
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in sorted(run_dir.iterdir()):
+            if f.is_file():
+                z.write(f, f"{run_dir.name}/{f.name}")
+    return buf.getvalue()
+
+
+def import_run_zip(data: bytes, out_dir: Path = RUNS_DIR) -> Path:
+    """Restore a run folder from a zip made by run_zip_bytes. Returns the folder."""
+    with zipfile.ZipFile(BytesIO(data)) as z:
+        names = z.namelist()
+        meta_name = next((n for n in names if n.endswith("meta.json")), None)
+        raw_name = next((n for n in names if n.endswith("raw.jsonl")), None)
+        if not meta_name or not raw_name:
+            raise ValueError("Zip must contain meta.json and raw.jsonl from an AFP run.")
+        meta = json.loads(z.read(meta_name).decode("utf-8"))
+        raw = z.read(raw_name).decode("utf-8")
+    for line in raw.splitlines():  # validate before writing anything
+        if line.strip():
+            json.loads(line)
+    run_dir = Path(out_dir) / _slug(meta.get("run_id", "imported-run"))[:80]
+    if (run_dir / "raw.jsonl").exists():
+        if (run_dir / "raw.jsonl").read_text(encoding="utf-8") == raw:
+            return run_dir  # already imported
+        run_dir = _new_run_dir(out_dir, run_dir.name + "-imported")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    (run_dir / "raw.jsonl").write_text(raw, encoding="utf-8")
+    return run_dir
+
+
+def combine_runs(run_dirs: list[Path], out_dir: Path = RUNS_DIR, note: str = "") -> Path:
+    """Pool several runs (e.g. one task per run) into one new run folder.
+
+    Refuses runs whose model, temperature, seed or prompts differ. With the same seed,
+    item k of a task is identical in every run, so a call made in two runs is kept once
+    (latest successful answer wins; API-error rows never replace a real answer)."""
+    run_dirs = [Path(d) for d in run_dirs]
+    if len(run_dirs) < 2:
+        raise ValueError("Select at least two runs to combine.")
+    metas = [json.loads((d / "meta.json").read_text(encoding="utf-8")) for d in run_dirs]
+    for d, m in zip(run_dirs, metas):
+        if m.get("combined"):
+            raise ValueError(f"{d.name} is already a combined run; combine the originals.")
+    ref = metas[0]
+    for m in metas[1:]:
+        for k in COMBINE_KEYS:
+            if m.get(k) != ref.get(k):
+                a, b = str(ref.get(k))[:60], str(m.get(k))[:60]
+                raise ValueError(f"Can't combine: '{k}' differs between {ref['run_id']} "
+                                 f"({a}) and {m['run_id']} ({b}).")
+    order = sorted(range(len(run_dirs)), key=lambda i: metas[i].get("started_utc", ""))
+    best: dict[tuple, dict] = {}
+    n_by_task: dict[str, int] = {}
+    for i in order:
+        m = metas[i]
+        for t in m["tasks"]:
+            n_by_task[t] = max(n_by_task.get(t, 0), int(m["n_per_task"]))
+        for line in (run_dirs[i] / "raw.jsonl").read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            key = (r["task_id"], int(r["item_id"]), r["condition"])
+            if key not in best or not r.get("error") or best[key].get("error"):
+                r["source_run_id"] = r.get("source_run_id") or r.get("run_id")
+                best[key] = r
+    tasks = [t for t in TASKS if t in n_by_task]
+    run_dir = _new_run_dir(out_dir, f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}_"
+                                    f"combined_{_slug(ref['model'])}")
+    run_id = run_dir.name
+    incomplete = [m["run_id"] for m in metas if m.get("status") != "complete"]
+    meta = {k: ref.get(k) for k in COMBINE_KEYS}
+    meta.update({
+        "run_id": run_id, "app_version": APP_VERSION, "combined": True,
+        "source_runs": [metas[i]["run_id"] for i in order], "host": ref.get("host"),
+        "tasks": tasks, "n_by_task": {t: n_by_task[t] for t in tasks},
+        "n_per_task": max(n_by_task.values()), "note": note,
+        "started_utc": min(m.get("started_utc", "") for m in metas),
+        "finished_utc": max(m.get("finished_utc", "") or "" for m in metas),
+        "temperature_dropped": any(m.get("temperature_dropped") for m in metas),
+        "status": "complete" if not incomplete else
+                  "partial: source runs not complete: " + ", ".join(incomplete),
+    })
+    with (run_dir / "raw.jsonl").open("w", encoding="utf-8") as fh:
+        for t in tasks:
+            for key in sorted(k for k in best if k[0] == t):
+                r = dict(best[key])
+                r["run_id"] = run_id
+                fh.write(json.dumps(r, default=str) + "\n")
+    meta["calls_done"] = len(_done_keys(run_dir / "raw.jsonl"))
+    meta["calls_planned"] = planned_calls(meta)
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return run_dir
 
@@ -1648,7 +1778,7 @@ def main_ui():  # pragma: no cover - exercised manually
                     m = json.loads((p / "meta.json").read_text(encoding="utf-8"))
                     return (f"{p.name}  [{m.get('status', 'interrupted')}; "
                             f"{len(_done_keys(p / 'raw.jsonl'))}/"
-                            f"{len(m['tasks']) * int(m['n_per_task']) * 2} calls]")
+                            f"{planned_calls(m)} calls]")
                 except Exception:
                     return p.name
             labels = {_label(p): p for p in runs}
@@ -1659,6 +1789,33 @@ def main_ui():  # pragma: no cover - exercised manually
                 st.success("Loaded. Open the Results tab.")
             if c2.button("Resume run (finish missing calls)"):
                 _execute(resume_dir=labels[pick])
+
+        st.divider()
+        st.subheader("Combine runs")
+        st.caption("Pool runs (e.g. one task per run) into one table and one set of charts. "
+                   "Runs must share backend, model, temperature, seed and prompts. "
+                   "On Streamlit Cloud, keep each run's .zip (Results tab) and upload "
+                   "them here after a restart.")
+        ups = st.file_uploader("Add saved run(s) (.zip)", type="zip",
+                               accept_multiple_files=True)
+        if ups and st.button("Import uploaded run(s)"):
+            for up in ups:
+                try:
+                    st.success(f"Imported {import_run_zip(up.getvalue()).name}")
+                except (ValueError, zipfile.BadZipFile, json.JSONDecodeError) as e:
+                    st.error(f"{up.name}: {e}")
+            st.rerun()
+        if runs:
+            chosen = st.multiselect("Runs to combine", list(labels))
+            cnote = st.text_input("Note for combined run (optional)", "")
+            if st.button("Combine selected runs", disabled=len(chosen) < 2):
+                try:
+                    cd = combine_runs([labels[c] for c in chosen], note=cnote)
+                    export_report(cd, fix, alpha, int(min_n), margin)
+                    st.session_state["run_dir"] = str(cd)
+                    st.success(f"Combined into {cd.name}. Open the Results tab.")
+                except ValueError as e:
+                    st.error(str(e))
         else:
             st.caption("No saved runs yet. On Streamlit Community Cloud, saved runs are "
                        "lost when the app restarts; download results after each run.")
@@ -1679,8 +1836,13 @@ def main_ui():  # pragma: no cover - exercised manually
             st.write(f"**Run** `{meta['run_id']}` · model `{meta['model']}` "
                      f"({meta['backend']}) · T={meta['temperature']}"
                      f"{' (dropped: model rejected it)' if meta.get('temperature_dropped') else ''}"
-                     f" · seed {meta['seed']} · n/task {meta['n_per_task']} · "
+                     f" · seed {meta['seed']} · n/task "
+                     f"{meta.get('n_by_task') or meta['n_per_task']} · "
                      f"started {meta['started_utc']}")
+            if meta.get("combined"):
+                st.caption("Combined from: " + ", ".join(meta.get("source_runs", [])))
+            if meta.get("status") not in (None, "complete"):
+                st.warning(f"Run status: {meta['status']}")
             st.subheader("Failure groups")
             st.dataframe(group_table(s), hide_index=True)
             st.subheader("Per-task results")
@@ -1695,7 +1857,10 @@ def main_ui():  # pragma: no cover - exercised manually
             st.subheader("Calibration table (all tasks pooled)")
             st.dataframe(calibration_table(df), hide_index=True)
             st.subheader("Downloads")
-            d1, d2, d3 = st.columns(3)
+            d0, d1, d2, d3 = st.columns(4)
+            d0.download_button("Whole run (.zip)", run_zip_bytes(Path(run_dir)),
+                               f"{Path(run_dir).name}.zip", type="primary",
+                               help="Keep this: it can be re-imported and combined later.")
             d1.download_button("Summary (CSV)", s.to_csv(index=False), "summary.csv")
             d2.download_button("Readable table (CSV)", display_table(s).to_csv(index=False),
                                "summary_readable.csv")
@@ -1750,7 +1915,9 @@ def main_ui():  # pragma: no cover - exercised manually
 
 def cli(argv: Optional[list[str]] = None) -> Path:
     ap = argparse.ArgumentParser(description="AFP - AI Failure Points (CLI)")
-    ap.add_argument("--backend", choices=list(BACKEND_DEFAULTS), required=True)
+    ap.add_argument("--backend", choices=list(BACKEND_DEFAULTS))
+    ap.add_argument("--combine", nargs="+", default=None, metavar="RUN_FOLDER",
+                    help="Pool these run folders into one combined run, then exit")
     ap.add_argument("--model", default=None)
     ap.add_argument("--api-key", default=None, help="Defaults to the env variable")
     ap.add_argument("--host", default=None)
@@ -1777,6 +1944,16 @@ def cli(argv: Optional[list[str]] = None) -> Path:
         for t in TASKS.values():
             print(f"{t.id:20s} {t.name}")
         sys.exit(0)
+    if a.combine:
+        cd = combine_runs([Path(x) for x in a.combine], Path(a.out), a.note)
+        export_report(cd, a.fix, a.alpha, a.min_n, a.margin)
+        df, _ = load_run(cd)
+        print(display_table(summarize(df, a.fix, a.alpha, a.min_n, a.margin))
+              .iloc[:, :11].to_string(index=False))
+        print(f"\nCombined run saved to {cd}")
+        return cd
+    if not a.backend:
+        ap.error("--backend is required (unless using --combine or --list-tasks)")
     dmodel, _, dhost = BACKEND_DEFAULTS[a.backend]
     task_ids = list(TASKS) if a.tasks == "all" else [t.strip() for t in a.tasks.split(",")]
     bad = [t for t in task_ids if t not in TASKS]
