@@ -944,28 +944,62 @@ def _slug(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-")[:40] or "model"
 
 
+def _done_keys(raw_path: Path) -> set[tuple]:
+    """(task_id, item_id, condition) already answered without an API error."""
+    keys: set[tuple] = set()
+    if raw_path.exists():
+        for line in raw_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                r = json.loads(line)
+                if not r.get("error"):
+                    keys.add((r["task_id"], int(r["item_id"]), r["condition"]))
+    return keys
+
+
 def run_experiment(backend: Backend, task_ids: list[str], n: int, seed: int,
                    out_dir: Path = RUNS_DIR, delay: float = 0.0,
                    progress: Optional[Callable[[int, int, dict], None]] = None,
-                   note: str = "") -> Path:
+                   note: str = "", resume_dir: Optional[Path] = None,
+                   max_consecutive_errors: int = 5) -> Path:
     """Run every task x item x condition. Rows are appended to raw.jsonl as they
-    complete, so an interrupted run keeps everything collected so far."""
-    run_id = f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}_{backend.kind}_{_slug(backend.model)}"
-    run_dir = Path(out_dir) / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    meta = {
-        "run_id": run_id, "app_version": APP_VERSION, "backend": backend.kind,
-        "model": backend.model, "host": backend.host, "temperature": backend.temperature,
-        "seed": seed, "n_per_task": n, "tasks": task_ids, "note": note,
-        "simulated": backend.simulated,
-        "started_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        "opt_system_prompt": OPT_SYSTEM, "format_lines": FORMAT_LINES,
-        "confident_threshold": CONFIDENT_THRESHOLD,
-    }
+    complete, so an interrupted run keeps everything collected so far.
+
+    resume_dir: continue an earlier run folder; finished calls are skipped and calls
+    that ended in an API error are retried (tasks, n and seed come from its meta.json).
+    max_consecutive_errors: stop early (e.g. rate or usage limit reached) instead of
+    spending the remaining calls on errors. meta.json records why it stopped."""
+    if resume_dir:
+        run_dir = Path(resume_dir)
+        meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+        if (meta["backend"], meta["model"]) != (backend.kind, backend.model):
+            raise ValueError(f"Run was made with {meta['backend']}/{meta['model']}; "
+                             f"select that backend and model to resume it.")
+        task_ids, n, seed = meta["tasks"], int(meta["n_per_task"]), int(meta["seed"])
+        run_id = meta["run_id"]
+        meta.setdefault("resumed_utc", []).append(
+            dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"))
+    else:
+        run_id = (f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}_{backend.kind}_"
+                  f"{_slug(backend.model)}")
+        run_dir = Path(out_dir) / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "run_id": run_id, "app_version": APP_VERSION, "backend": backend.kind,
+            "model": backend.model, "host": backend.host,
+            "temperature": backend.temperature, "seed": seed, "n_per_task": n,
+            "tasks": task_ids, "note": note, "simulated": backend.simulated,
+            "started_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            "opt_system_prompt": OPT_SYSTEM, "format_lines": FORMAT_LINES,
+            "confident_threshold": CONFIDENT_THRESHOLD,
+        }
+    meta["status"] = "running"
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     raw_path = run_dir / "raw.jsonl"
+    skip = _done_keys(raw_path)
     total = len(task_ids) * n * len(CONDITIONS)
-    done = 0
+    done = len(skip)
+    consecutive_errors = 0
+    stop_reason = ""
     with raw_path.open("a", encoding="utf-8") as fh:
         for tid in task_ids:
             task = TASKS[tid]
@@ -974,6 +1008,8 @@ def run_experiment(backend: Backend, task_ids: list[str], n: int, seed: int,
                 conds = list(CONDITIONS)
                 order_rng.shuffle(conds)  # avoid systematic order effects
                 for cond in conds:
+                    if (tid, item.item_id, cond) in skip:
+                        continue
                     row = run_one(backend, task, item, cond)
                     row.update({"run_id": run_id, "backend": backend.kind,
                                 "model": backend.model, "simulated": backend.simulated})
@@ -982,8 +1018,20 @@ def run_experiment(backend: Backend, task_ids: list[str], n: int, seed: int,
                     done += 1
                     if progress:
                         progress(done, total, row)
+                    consecutive_errors = consecutive_errors + 1 if row["error"] else 0
+                    if consecutive_errors >= max_consecutive_errors:
+                        stop_reason = (f"stopped after {consecutive_errors} consecutive API "
+                                       f"errors; last: {row['error'][:300]}")
+                        break
                     if delay and not backend.simulated:
                         time.sleep(delay)
+                if stop_reason:
+                    break
+            if stop_reason:
+                break
+    meta["status"] = stop_reason or "complete"
+    meta["calls_done"] = len(_done_keys(raw_path))
+    meta["calls_planned"] = total
     meta["finished_utc"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     meta["temperature_dropped"] = backend.temperature_dropped
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -997,6 +1045,9 @@ def load_run(run_dir: Path) -> tuple[pd.DataFrame, dict]:
             (run_dir / "raw.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     df = pd.DataFrame(rows)
     if not df.empty:
+        # A resumed run retries calls that hit API errors: keep the latest attempt.
+        df = df.drop_duplicates(subset=["task_id", "item_id", "condition"],
+                                keep="last").reset_index(drop=True)
         df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce")
     return df, meta
 
@@ -1460,6 +1511,13 @@ Accuracy intervals: Wilson 95%.
 """
 
 
+def _show_fig(fig):
+    """Render a matplotlib figure in Streamlit, then free its memory."""
+    import streamlit as st
+    st.pyplot(fig)
+    plt.close(fig)
+
+
 def main_ui():  # pragma: no cover - exercised manually
     import streamlit as st
 
@@ -1513,39 +1571,97 @@ def main_ui():  # pragma: no cover - exercised manually
         if kind == "simulated":
             st.warning("Simulated backend: FAKE data for testing the pipeline. "
                        "Do not report these numbers.")
-        if st.button("Run experiment", type="primary", disabled=not task_ids):
-            needs_key = kind in ("gemini", "openai", "anthropic") or (
-                kind == "ollama" and "ollama.com" in host)
+        st.caption("While a run is in progress, don't change sidebar settings or click "
+                   "other buttons: Streamlit restarts the script and the run stops. "
+                   "Answers already received are saved and the run can be resumed below.")
+        needs_key = kind in ("gemini", "openai", "anthropic") or (
+            kind == "ollama" and "ollama.com" in host)
+
+        def _make_backend():
+            return Backend(kind, model, api_key=api_key, host=host,
+                           temperature=temp, seed=int(seed))
+
+        def _execute(resume_dir=None):
+            if needs_key and not api_key:
+                st.error(f"No API key. Set {envvar} or paste the key in the sidebar.")
+                return
+            bar = st.progress(0.0)
+            status = st.empty()
+            err_box = st.empty()
+
+            def _prog(done, total, row):
+                if row["error"]:
+                    err_box.error(f"API error: {row['error'][:500]}")
+                else:
+                    err_box.empty()
+                bar.progress(min(1.0, done / total))
+                mark = ("ERROR" if row["error"] else
+                        "excluded" if row["correct"] is None else
+                        "correct" if row["correct"] else "WRONG")
+                status.write(f"{done}/{total} · {TASKS[row['task_id']].name} · "
+                             f"{row['condition']} · item {row['item_id']} · {mark} · "
+                             f"{row['latency_s']:.1f}s")
+
+            try:
+                rd = run_experiment(_make_backend(), task_ids, int(n), int(seed),
+                                    delay=float(delay), progress=_prog, note=note,
+                                    resume_dir=resume_dir)
+            except ValueError as e:
+                st.error(str(e))
+                return
+            st.session_state["run_dir"] = str(rd)
+            _, m = load_run(rd)
+            if m.get("status") == "complete":
+                export_report(rd, fix, alpha, int(min_n), margin)
+                st.success(f"Done. Saved to {rd}. Open the Results tab.")
+            else:
+                st.warning(f"Run {m.get('status')}. {m.get('calls_done')}/"
+                           f"{m.get('calls_planned')} calls saved. If this is a usage or "
+                           "rate limit, wait and use 'Resume run' below. Partial results "
+                           "are in the Results tab.")
+
+        c_run, c_test = st.columns(2)
+        if c_test.button("Test connection (1 short call)"):
             if needs_key and not api_key:
                 st.error(f"No API key. Set {envvar} or paste the key in the sidebar.")
             else:
-                backend = Backend(kind, model, api_key=api_key, host=host,
-                                  temperature=temp, seed=int(seed))
-                bar = st.progress(0.0)
-                status = st.empty()
-
-                def _prog(done, total, row):
-                    bar.progress(done / total)
-                    mark = ("ERROR" if row["error"] else
-                            "excluded" if row["correct"] is None else
-                            "correct" if row["correct"] else "WRONG")
-                    status.write(f"{done}/{total} · {TASKS[row['task_id']].name} · "
-                                 f"{row['condition']} · item {row['item_id']} · {mark}")
-
-                run_dir = run_experiment(backend, task_ids, int(n), int(seed),
-                                         delay=float(delay), progress=_prog, note=note)
-                export_report(run_dir, fix, alpha, int(min_n), margin)
-                st.session_state["run_dir"] = str(run_dir)
-                st.success(f"Done. Saved to {run_dir}. Open the Results tab.")
+                t0 = time.time()
+                try:
+                    reply = _make_backend().chat(
+                        None, [{"role": "user", "content": "Reply with the single word OK."}],
+                        {"task": TASKS["letter_count"],
+                         "item": generate_items(TASKS["letter_count"], 1, 0)[0],
+                         "condition": "baseline"})
+                    st.success(f"Connected to {model} in {time.time() - t0:.1f}s. "
+                               f"Reply: {reply[:200]!r}")
+                except BackendError as e:
+                    st.error(f"Failed after {time.time() - t0:.0f}s: {e}")
+        if c_run.button("Run experiment", type="primary", disabled=not task_ids):
+            _execute()
 
         st.divider()
         runs = sorted([p for p in RUNS_DIR.glob("*") if (p / "raw.jsonl").exists()],
                       reverse=True) if RUNS_DIR.exists() else []
         if runs:
-            pick = st.selectbox("Or load a previous run", [p.name for p in runs])
-            if st.button("Load run"):
-                st.session_state["run_dir"] = str(RUNS_DIR / pick)
-                st.success(f"Loaded {pick}. Open the Results tab.")
+            def _label(p):
+                try:
+                    m = json.loads((p / "meta.json").read_text(encoding="utf-8"))
+                    return (f"{p.name}  [{m.get('status', 'interrupted')}; "
+                            f"{len(_done_keys(p / 'raw.jsonl'))}/"
+                            f"{len(m['tasks']) * int(m['n_per_task']) * 2} calls]")
+                except Exception:
+                    return p.name
+            labels = {_label(p): p for p in runs}
+            pick = st.selectbox("Previous runs", list(labels))
+            c1, c2 = st.columns(2)
+            if c1.button("Load run (view results)"):
+                st.session_state["run_dir"] = str(labels[pick])
+                st.success("Loaded. Open the Results tab.")
+            if c2.button("Resume run (finish missing calls)"):
+                _execute(resume_dir=labels[pick])
+        else:
+            st.caption("No saved runs yet. On Streamlit Community Cloud, saved runs are "
+                       "lost when the app restarts; download results after each run.")
 
     run_dir = st.session_state.get("run_dir")
     df = meta = s = None
@@ -1570,12 +1686,12 @@ def main_ui():  # pragma: no cover - exercised manually
             st.subheader("Per-task results")
             st.dataframe(display_table(s), hide_index=True)
             suffix = f"\n{meta['model']} ({meta['backend']})" + ("  [SIMULATED]" if sim else "")
-            st.pyplot(fig_dumbbell(s, fix, suffix, sim))
+            _show_fig(fig_dumbbell(s, fix, suffix, sim))
             c1, c2 = st.columns([3, 2])
             with c1:
-                st.pyplot(fig_conf_wrong(s, suffix, sim))
+                _show_fig(fig_conf_wrong(s, suffix, sim))
             with c2:
-                st.pyplot(fig_calibration(df, suffix, sim))
+                _show_fig(fig_calibration(df, suffix, sim))
             st.subheader("Calibration table (all tasks pooled)")
             st.dataframe(calibration_table(df), hide_index=True)
             st.subheader("Downloads")
@@ -1650,6 +1766,10 @@ def cli(argv: Optional[list[str]] = None) -> Path:
     ap.add_argument("--margin", type=float, default=0.10,
                     help="Non-significant gain >= this is 'Inconclusive', not 'insensitive'")
     ap.add_argument("--note", default="")
+    ap.add_argument("--resume", default=None,
+                    help="Run folder to continue (tasks, n and seed are taken from it)")
+    ap.add_argument("--max-errors", type=int, default=5,
+                    help="Stop after this many consecutive API errors")
     ap.add_argument("--list-tasks", action="store_true")
     a = ap.parse_args(argv)
 
@@ -1677,8 +1797,12 @@ def cli(argv: Optional[list[str]] = None) -> Path:
               end="", flush=True)
 
     run_dir = run_experiment(backend, task_ids, a.n, a.seed, Path(a.out), a.delay,
-                             _prog, a.note)
+                             _prog, a.note, resume_dir=Path(a.resume) if a.resume else None,
+                             max_consecutive_errors=a.max_errors)
     print()
+    status = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))["status"]
+    if status != "complete":
+        print(f"Run {status}\nResume later with: --resume \"{run_dir}\"")
     paths = export_report(run_dir, a.fix, a.alpha, a.min_n, a.margin)
     df, meta = load_run(run_dir)
     s = summarize(df, a.fix, a.alpha, a.min_n, a.margin)
