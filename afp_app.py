@@ -59,7 +59,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import pandas as pd  # noqa: E402
 import requests  # noqa: E402
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.2"
 SCORER_VERSION = "2"  # bump whenever task generation, prompts or scoring change
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
 LEVELS = (1, 2, 3)
@@ -1028,29 +1028,90 @@ class Backend:
         return data["choices"][0]["message"].get("content") or ""
 
     def _anthropic(self, system, messages):
+        """Streamed Messages API call (streaming avoids HTTP timeouts on long replies).
+
+        Money safety: a request is retried only if it failed BEFORE the reply started
+        (rate limit, overload, server error, connection refused); those are not billed.
+        Once the reply has started streaming, any failure raises BackendError without a
+        retry, and the tokens already reported are kept in last_usage so the app counts
+        them as spent."""
         payload: dict = {"model": self.model, "max_tokens": self.max_tokens,
-                         "messages": messages}
+                         "messages": messages, "stream": True}
         if system:
             payload["system"] = system
         if self._temp() is not None:
             payload["temperature"] = self._temp()
         if self.effort:
             payload["output_config"] = {"effort": self.effort}
-        data = self._post("https://api.anthropic.com/v1/messages", payload,
-                          {"x-api-key": self.api_key, "anthropic-version": "2023-06-01"})
-        u = data.get("usage") or {}
-        self.last_usage = {
-            "input_tokens": int(u.get("input_tokens") or 0),
-            "cache_creation_input_tokens": int(u.get("cache_creation_input_tokens") or 0),
-            "cache_read_input_tokens": int(u.get("cache_read_input_tokens") or 0),
-            "output_tokens": int(u.get("output_tokens") or 0),
-            "thinking_tokens": int((u.get("output_tokens_details") or {}).get("thinking_tokens")
-                                   or 0),
-            "stop_reason": data.get("stop_reason"),
-        }
-        # Thinking blocks are not part of the answer: only text blocks are returned.
-        return "".join(b.get("text", "") for b in data.get("content", [])
-                       if b.get("type") == "text")
+        headers = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01",
+                   "accept": "text/event-stream"}
+        try:
+            r = requests.post("https://api.anthropic.com/v1/messages", json=payload,
+                              headers=headers, stream=True, timeout=(30, 300))
+        except (requests.Timeout, requests.ConnectionError) as e:
+            raise _Retryable(f"network (before reply): {e}") from e
+        try:
+            if r.status_code in (408, 409, 429, 500, 502, 503, 504, 529):
+                raise _Retryable(f"HTTP {r.status_code}: {r.text[:300]}")
+            if r.status_code >= 400:
+                body = r.text[:800]
+                if (r.status_code == 400 and "temperature" in body.lower()
+                        and not self.temperature_dropped and self.temperature is not None):
+                    self.temperature_dropped = True
+                    raise _Retryable("temperature not supported by this model; retrying "
+                                     "without it")
+                raise BackendError(f"HTTP {r.status_code}: {body}")
+            usage = {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                     "cache_read_input_tokens": 0, "output_tokens": 0, "thinking_tokens": 0,
+                     "stop_reason": None}
+            self.last_usage = usage
+            text_parts: list[str] = []
+            finished = False
+            try:
+                for line in r.iter_lines(decode_unicode=True):
+                    if not line or not line.startswith("data:"):
+                        continue
+                    ev = json.loads(line[5:].strip())
+                    et = ev.get("type")
+                    if et == "message_start":
+                        u = (ev.get("message") or {}).get("usage") or {}
+                        for k in ("input_tokens", "cache_creation_input_tokens",
+                                  "cache_read_input_tokens", "output_tokens"):
+                            usage[k] = int(u.get(k) or 0)
+                    elif et == "content_block_delta":
+                        d = ev.get("delta") or {}
+                        if d.get("type") == "text_delta":  # thinking is never returned
+                            text_parts.append(d.get("text", ""))
+                    elif et == "message_delta":
+                        u = ev.get("usage") or {}  # cumulative
+                        if "output_tokens" in u:
+                            usage["output_tokens"] = int(u["output_tokens"] or 0)
+                        for k in ("input_tokens", "cache_creation_input_tokens",
+                                  "cache_read_input_tokens"):
+                            if u.get(k) is not None:
+                                usage[k] = int(u[k])
+                        usage["thinking_tokens"] = int(
+                            (u.get("output_tokens_details") or {}).get("thinking_tokens")
+                            or usage["thinking_tokens"])
+                        usage["stop_reason"] = (ev.get("delta") or {}).get(
+                            "stop_reason", usage["stop_reason"])
+                    elif et == "message_stop":
+                        finished = True
+                        break
+                    elif et == "error":
+                        err = ev.get("error") or {}
+                        raise BackendError(f"stream error after the reply started "
+                                           f"({err.get('type')}: {err.get('message')}); "
+                                           "not retried, tokens so far counted as spent")
+            except (requests.RequestException, ValueError) as e:
+                raise BackendError(f"stream interrupted after the reply started ({e}); "
+                                   "not retried, tokens so far counted as spent") from e
+            if not finished:
+                raise BackendError("stream ended without message_stop; not retried, "
+                                   "tokens so far counted as spent")
+            return "".join(text_parts)
+        finally:
+            r.close()
 
     def _simulated(self, messages, sim):
         task: Task = sim["task"]
@@ -1188,6 +1249,30 @@ def anthropic_count_tokens(api_key: str, model: str, system: Optional[str],
     return int(r.json()["input_tokens"])
 
 
+def duplicate_calls(raw_path: Path) -> int:
+    """Successful calls beyond the first for the same (task, level, item, condition)."""
+    seen: dict[tuple, int] = {}
+    raw_path = Path(raw_path)
+    if raw_path.exists():
+        for x in raw_path.read_text(encoding="utf-8").splitlines():
+            if x.strip():
+                r = json.loads(x)
+                if not r.get("error"):
+                    k = (r["task_id"], int(r["level"]), int(r["item_id"]), r["condition"])
+                    seen[k] = seen.get(k, 0) + 1
+    return sum(v - 1 for v in seen.values())
+
+
+def raw_spend(raw_path: Path, prices: tuple[float, float]) -> float:
+    """USD of every call recorded in raw.jsonl (each line is a call that was billed,
+    including calls later retried). This, not meta.json, is the spend of record."""
+    raw_path = Path(raw_path)
+    if not raw_path.exists():
+        return 0.0
+    return sum(usage_cost(json.loads(x).get("usage"), prices)
+               for x in raw_path.read_text(encoding="utf-8").splitlines() if x.strip())
+
+
 def output_profile(run_dir: Path) -> dict[tuple, float]:
     """Mean billed output tokens per (task, level, condition) measured in a run."""
     rows = [json.loads(x) for x in (Path(run_dir) / "raw.jsonl").read_text(
@@ -1292,9 +1377,12 @@ def run_one(backend: Backend, task: Task, item: Item, condition: str) -> dict:
 
     def _call(m):
         backend.last_usage = None
-        out = backend.chat(system, m, sim)
-        if backend.last_usage is not None:
-            usages.append(backend.last_usage)
+        try:
+            out = backend.chat(system, m, sim)
+        finally:
+            # Usage is kept even when the call fails part-way, so its cost is counted.
+            if backend.last_usage is not None:
+                usages.append(backend.last_usage)
         return out
 
     try:
@@ -1366,6 +1454,43 @@ def _done_keys(raw_path: Path) -> set[tuple]:
     return keys
 
 
+LOCK_NAME = "run.lock"
+LOCK_STALE_S = 30 * 60  # a lock older than this is treated as left over from a crash
+
+
+def _now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def lock_status(run_dir: Path) -> Optional[float]:
+    """Seconds since the run's last heartbeat if another process may still be running
+    it, else None."""
+    lp = Path(run_dir) / LOCK_NAME
+    if not lp.exists():
+        return None
+    try:
+        hb = dt.datetime.fromisoformat(json.loads(lp.read_text(encoding="utf-8"))["heartbeat"])
+        age = (_now_utc() - hb).total_seconds()
+    except Exception:
+        return None
+    return age if age < LOCK_STALE_S else None
+
+
+def _write_lock(run_dir: Path, token: str) -> None:
+    (Path(run_dir) / LOCK_NAME).write_text(json.dumps(
+        {"token": token, "pid": os.getpid(), "heartbeat": _now_utc().isoformat()}),
+        encoding="utf-8")
+
+
+def _release_lock(run_dir: Path, token: str) -> None:
+    lp = Path(run_dir) / LOCK_NAME
+    try:
+        if json.loads(lp.read_text(encoding="utf-8")).get("token") == token:
+            lp.unlink()
+    except Exception:
+        pass
+
+
 def make_plan(task_ids: list[str], levels: list[int]) -> list[list]:
     return [[t, lv] for t in task_ids for lv in TASKS[t].supported(levels)]
 
@@ -1397,6 +1522,13 @@ def run_experiment(backend: Backend, task_ids: list[str], n: int, seed: int,
     the budget has already been paid for)."""
     if resume_dir:
         run_dir = Path(resume_dir)
+        age = lock_status(run_dir)
+        if age is not None:
+            raise ValueError(
+                f"This run may still be active in another window or session (last call "
+                f"started {age / 60:.0f} min ago). Resuming now could pay for the same "
+                f"call twice. Close other windows, wait for it to finish, or wait "
+                f"{(LOCK_STALE_S - age) / 60:.0f} min if you are sure nothing is running.")
         meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
         if meta.get("combined"):
             raise ValueError("A combined run can't be resumed. Resume the original run, "
@@ -1449,15 +1581,38 @@ def run_experiment(backend: Backend, task_ids: list[str], n: int, seed: int,
     if cost_estimate:
         meta.setdefault("cost_estimates", []).append(
             {k: v for k, v in cost_estimate.items() if k != "cells"})
-    spent = float(meta.get("spent_usd") or 0.0)
+    raw_path = run_dir / "raw.jsonl"
+    # Spend so far is recomputed from the saved calls, so an interrupted run that is
+    # resumed keeps counting from the true total (meta.json may be out of date).
+    spent = raw_spend(raw_path, prices) if prices else 0.0
     meta["status"] = "running"
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    raw_path = run_dir / "raw.jsonl"
     skip = _done_keys(raw_path)
     total = len(plan) * n * len(conditions)
-    done = len(skip)
+    token = f"{os.getpid()}-{time.time_ns()}"
+    state = {"done": len(skip), "spent": spent, "stop": ""}
+    _write_lock(run_dir, token)
+    try:
+        _run_loop(backend, run_dir, run_id, plan, n, seed, conditions, skip, total, prices,
+                  budget_usd, max_consecutive_errors, delay, progress, meta, token, state)
+    finally:
+        _release_lock(run_dir, token)
+    stop_reason = state["stop"]
+    meta["status"] = stop_reason or "complete"
+    meta["calls_done"] = len(_done_keys(raw_path))
+    meta["calls_planned"] = total
+    meta["finished_utc"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    meta["temperature_dropped"] = backend.temperature_dropped
+    if prices:
+        meta["spent_usd"] = round(state["spent"], 6)
+    (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return run_dir
+
+
+def _run_loop(backend, run_dir, run_id, plan, n, seed, conditions, skip, total, prices,
+              budget_usd, max_consecutive_errors, delay, progress, meta, token, state):
+    raw_path = run_dir / "raw.jsonl"
     consecutive_errors = 0
-    stop_reason = ""
     with raw_path.open("a", encoding="utf-8") as fh:
         for tid, lv in plan:
             task = TASKS[tid]
@@ -1468,41 +1623,33 @@ def run_experiment(backend: Backend, task_ids: list[str], n: int, seed: int,
                 for cond in conds:
                     if (tid, lv, item.item_id, cond) in skip:
                         continue
+                    _write_lock(run_dir, token)  # heartbeat before every paid call
                     row = run_one(backend, task, item, cond)
                     row.update({"run_id": run_id, "backend": backend.kind,
                                 "model": backend.model, "simulated": backend.simulated,
                                 "scorer_version": SCORER_VERSION})
                     fh.write(json.dumps(row, default=str) + "\n")
                     fh.flush()
-                    done += 1
-                    if progress:
-                        progress(done, total, row)
+                    state["done"] += 1
                     if prices:
-                        spent += usage_cost(row.get("usage"), prices)
-                        if budget_usd is not None and spent >= budget_usd:
-                            stop_reason = (f"stopped: budget of ${budget_usd:.2f} reached "
-                                           f"(spent ${spent:.2f})")
-                            break
+                        state["spent"] += usage_cost(row.get("usage"), prices)
+                        meta["spent_usd"] = round(state["spent"], 6)  # saved every call
+                        (run_dir / "meta.json").write_text(json.dumps(meta, indent=2),
+                                                           encoding="utf-8")
+                    if progress:  # after saving: the UI may stop the script here
+                        progress(state["done"], total, row)
+                    if (prices and budget_usd is not None
+                            and state["spent"] >= budget_usd):
+                        state["stop"] = (f"stopped: budget of ${budget_usd:.2f} reached "
+                                         f"(spent ${state['spent']:.2f})")
+                        return
                     consecutive_errors = consecutive_errors + 1 if row["error"] else 0
                     if consecutive_errors >= max_consecutive_errors:
-                        stop_reason = (f"stopped after {consecutive_errors} consecutive API "
-                                       f"errors; last: {row['error'][:300]}")
-                        break
+                        state["stop"] = (f"stopped after {consecutive_errors} consecutive "
+                                         f"API errors; last: {row['error'][:300]}")
+                        return
                     if delay and not backend.simulated:
                         time.sleep(delay)
-                if stop_reason:
-                    break
-            if stop_reason:
-                break
-    meta["status"] = stop_reason or "complete"
-    meta["calls_done"] = len(_done_keys(raw_path))
-    meta["calls_planned"] = total
-    meta["finished_utc"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    meta["temperature_dropped"] = backend.temperature_dropped
-    if prices:
-        meta["spent_usd"] = round(spent, 6)
-    (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    return run_dir
 
 
 # ---- saving, importing, combining, loading -------------------------------- #
@@ -1559,7 +1706,7 @@ def combine_runs(run_dirs: list[Path], out_dir: Path = RUNS_DIR, note: str = "")
     """Pool several runs into one new run folder. Refuses runs whose model,
     temperature, seed, prompts or scorer version differ. With the same seed, item k of
     a (task, level) is identical in every run, so a call made twice is kept once
-    (latest successful answer wins; API-error rows never replace a real answer)."""
+    (the earliest successful answer is kept; later answers never replace it)."""
     run_dirs = [Path(d) for d in run_dirs]
     if len(run_dirs) < 2:
         raise ValueError("Select at least two runs to combine.")
@@ -1582,7 +1729,7 @@ def combine_runs(run_dirs: list[Path], out_dir: Path = RUNS_DIR, note: str = "")
             if line.strip():
                 r = json.loads(line)
                 k = _key(r)
-                if k not in best or not r.get("error") or best[k].get("error"):
+                if k not in best or (best[k].get("error") and not r.get("error")):
                     r["source_run_id"] = r.get("source_run_id") or r.get("run_id")
                     best[k] = r
         ip = run_dirs[i] / "items.jsonl"
@@ -1618,7 +1765,9 @@ def combine_runs(run_dirs: list[Path], out_dir: Path = RUNS_DIR, note: str = "")
         "status": "complete" if not incomplete else
                   "partial: source runs not complete: " + ", ".join(incomplete),
         "calls_planned": sum(planned_calls(m) for m in metas),
-        "spent_usd": round(sum(float(m.get("spent_usd") or 0) for m in metas), 6),
+        "spent_usd": round(sum(raw_spend(d / "raw.jsonl", tuple(m["prices_usd_per_mtok"]))
+                               for d, m in zip(run_dirs, metas)
+                               if m.get("prices_usd_per_mtok")), 6),
         "prices_usd_per_mtok": ref.get("prices_usd_per_mtok"),
     })
     meta["calls_done"] = len(_done_keys(run_dir / "raw.jsonl"))
@@ -1639,8 +1788,13 @@ def load_run(run_dir: Path) -> tuple[pd.DataFrame, dict]:
     df = pd.DataFrame(rows)
     if df.empty:
         return df, meta
-    df = df.drop_duplicates(subset=["task_id", "level", "item_id", "condition"],
-                            keep="last").reset_index(drop=True)
+    # If a call was made more than once (a retried API error, or a duplicate call), the
+    # FIRST successful answer is the one scored; later answers are never used to
+    # replace it. Duplicates are reported (duplicate_calls) because each was billed.
+    df["_err"] = df["error"].astype(bool)
+    df = (df.reset_index().sort_values(["_err", "index"])
+          .drop_duplicates(subset=["task_id", "level", "item_id", "condition"], keep="first")
+          .sort_values("index").drop(columns=["index", "_err"]).reset_index(drop=True))
     outcomes, parsed = [], []
     for r in df.itertuples():
         if r.error:
@@ -1793,9 +1947,14 @@ def summarize(df: pd.DataFrame, fix: float = 0.95, alpha: float = 0.05,
               if (d["condition"] == c).any()}
         p = {c: _compare(d, task, "baseline", c, st["baseline"], st[c])
              for c in ("generic", "method") if c in st and "baseline" in st}
+        grp = classify(st, p, fix, alpha, min_n, margin)
+        why = ""
+        if grp == "Insufficient data":
+            why = ("scored answers " + ", ".join(f"{c} {st[c]['n']}" for c in st)
+                   + f"; minimum is {min_n} per condition")
         row = {"task_id": tid, "level": lv, "Task": task.name,
                "Unit": f"{task.name} · L{lv}", "Level detail": task.levels[lv],
-               "Group": classify(st, p, fix, alpha, min_n, margin),
+               "Group": grp, "Why insufficient": why,
                "Consequence (illustrative)": task.consequence,
                "Severity (author-assigned)": task.severity}
         row["Study group"] = GROUP_TO_DOUG.get(row["Group"], row["Group"])
@@ -1829,6 +1988,8 @@ def _pv(p):
 def display_table(s: pd.DataFrame) -> pd.DataFrame:
     t = pd.DataFrame({"Task · level": s["Unit"], "Level detail": s["Level detail"],
                       "Group (from data)": s["Group"], "Study group": s["Study group"]})
+    if s["Why insufficient"].astype(bool).any():
+        t["Why insufficient"] = s["Why insufficient"]
     for c in CONDITIONS:
         if s[f"n_{c}"].notna().any():
             lab = {"baseline": "Base", "generic": "Generic", "method": "Method"}[c]
@@ -1883,7 +2044,9 @@ def group_table(s: pd.DataFrame) -> pd.DataFrame:
         sub = s[s["Group"] == g]
         if len(sub):
             rows.append({"Group": g, "Study group": GROUP_TO_DOUG.get(g, ""),
-                         "Count": len(sub), "Which": ", ".join(sub["Unit"])})
+                         "Count": len(sub), "Which": ", ".join(sub["Unit"]),
+                         "Note": sub["Why insufficient"].iloc[0] if g == "Insufficient data"
+                         else ""})
     return pd.DataFrame(rows)
 
 
@@ -2301,6 +2464,13 @@ def main_ui():  # pragma: no cover - exercised through streamlit.testing
         if kind == "simulated":
             st.warning("Simulated backend: FAKE data for testing the pipeline. "
                        "Do not report these numbers.")
+        if int(n) < int(min_n):
+            st.warning(f"n = {int(n)} is below the minimum of {int(min_n)} scored answers per "
+                       "condition, so this run will report accuracy and answers but NO groups "
+                       "(every task will show 'Insufficient data'). That is fine for a pilot "
+                       "that checks the scoring; for groups use n ≥ "
+                       f"{int(min_n)} (more for the pushback task, which excludes items "
+                       "answered wrongly on the first turn).")
         st.caption("Before a large run, do a pilot with n = 5 and read the audit sample "
                    "(Results tab) to confirm the scoring. While a run is in progress, don't "
                    "change sidebar settings or click other buttons: Streamlit restarts the "
@@ -2328,9 +2498,11 @@ def main_ui():  # pragma: no cover - exercised through streamlit.testing
                         prof_runs[p.name] = p
                 except Exception:
                     continue
-            basis = st.selectbox("Output tokens per reply based on",
-                                 ["Default assumption (no measurement)"] +
-                                 [f"Measured in run {k}" for k in prof_runs])
+            basis_opts = ([f"Measured in run {k}" for k in prof_runs]
+                          + ["Default assumption (no measurement)"])
+            basis = st.selectbox("Output tokens per reply based on", basis_opts, index=0,
+                                 help="A measured run uses the real average output tokens "
+                                      "of an earlier run with this model.")
             profile = (output_profile(prof_runs[basis.replace("Measured in run ", "")])
                        if basis.startswith("Measured") else None)
             sig = json.dumps([kind, model, plan, int(n), int(seed), conditions, max_tokens,
@@ -2360,14 +2532,16 @@ def main_ui():  # pragma: no cover - exercised through streamlit.testing
                 accepted = st.checkbox(f"This run is estimated to cost "
                                        f"${est['expected_usd']:.2f} (worst case "
                                        f"${est['worst_usd']:.2f}); stop at ${budget:.2f}. "
-                                       "Continue?", key=f"accept_{sig}")
+                                       "Continue?",
+                                       key=f"accept_{sig}_{st.session_state.get('runs_done', 0)}")
             else:
                 st.info("Click 'Estimate cost' before running. The estimate must match the "
                         "current settings.")
-                budget = float(st.number_input("Budget for resuming a run ($)", 0.01,
-                                               10000.0, 1.0, 0.05))
-            resume_ok = st.checkbox(f"Allow resuming a run with a stop at ${budget:.2f}",
-                                    key="resume_ok")
+                budget = float(st.number_input(
+                    "Budget for resuming a run: stop when the run's TOTAL spend, including "
+                    "earlier calls, reaches ($)", 0.01, 10000.0, 1.0, 0.05))
+            resume_ok = st.checkbox(f"Allow resuming a run with a stop at ${budget:.2f} total",
+                                    key=f"resume_ok_{st.session_state.get('runs_done', 0)}")
 
         def _execute(resume_dir=None):
             if needs_key and not api_key:
@@ -2398,6 +2572,8 @@ def main_ui():  # pragma: no cover - exercised through streamlit.testing
                 st.error(str(e))
                 return
             st.session_state["run_dir"] = str(rd)
+            st.session_state["runs_done"] = st.session_state.get("runs_done", 0) + 1
+            st.session_state.pop("estimate", None)  # a new run needs a new confirmation
             m = json.loads((rd / "meta.json").read_text(encoding="utf-8"))
             if m.get("status") == "complete":
                 export_report(rd, fix, alpha, int(min_n), margin)
@@ -2437,7 +2613,11 @@ def main_ui():  # pragma: no cover - exercised through streamlit.testing
                 m = json.loads((p / "meta.json").read_text(encoding="utf-8"))
                 if m.get("scorer_version") != SCORER_VERSION:
                     continue  # runs from other app versions are not listed
-                labels[f"{p.name}  [{m.get('status', 'interrupted')}; "
+                status = m.get("status", "interrupted")
+                if status == "running":
+                    status = ("ACTIVE in another window/session" if lock_status(p) is not None
+                              else "interrupted")
+                labels[f"{p.name}  [{status}; "
                        f"{len(_done_keys(p / 'raw.jsonl'))}/{planned_calls(m)} calls]"] = p
             except Exception:
                 continue
@@ -2507,6 +2687,10 @@ def main_ui():  # pragma: no cover - exercised through streamlit.testing
                 st.caption("Combined from: " + ", ".join(meta.get("source_runs", [])))
             if meta.get("status") not in (None, "complete"):
                 st.warning(f"Run status: {meta['status']}")
+            dups = duplicate_calls(Path(run_dir) / "raw.jsonl")
+            if dups:
+                st.warning(f"{dups} call(s) were made twice for the same item and condition "
+                           "(both billed). The first answer is the one scored.")
             agree, total = score_check(df)
             (st.success if agree == total else st.error)(
                 f"Score check: re-scoring the raw replies reproduces the stored score for "
@@ -2521,7 +2705,9 @@ def main_ui():  # pragma: no cover - exercised through streamlit.testing
                              if meta.get("prices_usd_per_mtok") else None)
             if not ut.empty:
                 st.subheader("Tokens and cost (from API usage)")
-                spent = meta.get("spent_usd")
+                spent = (raw_spend(Path(run_dir) / "raw.jsonl",
+                                   tuple(meta["prices_usd_per_mtok"]))
+                         if meta.get("prices_usd_per_mtok") else None)
                 ests = meta.get("cost_estimates") or []
                 st.caption((f"Actual spend: ${spent:.4f}. " if spent is not None else "")
                            + (f"Estimate before the run: ${ests[0]['expected_usd']:.4f}."
@@ -2709,11 +2895,15 @@ def cli(argv: Optional[list[str]] = None) -> Optional[Path]:
         print(f"\r[{done:>5}/{total}] {row['task_id']:<18} L{row['level']} "
               f"{row['condition']:<9} {row['outcome']:<15}", end="", flush=True)
 
-    run_dir = run_experiment(backend, task_ids, a.n, a.seed, levels, conditions, Path(a.out),
-                             a.delay, _prog, a.note,
-                             resume_dir=Path(a.resume) if a.resume else None,
-                             max_consecutive_errors=a.max_errors, prices=prices,
-                             budget_usd=a.budget, cost_estimate=est)
+    try:
+        run_dir = run_experiment(backend, task_ids, a.n, a.seed, levels, conditions,
+                                 Path(a.out), a.delay, _prog, a.note,
+                                 resume_dir=Path(a.resume) if a.resume else None,
+                                 max_consecutive_errors=a.max_errors, prices=prices,
+                                 budget_usd=a.budget, cost_estimate=est)
+    except ValueError as e:
+        print(f"\nNot run: {e}")
+        return None
     print()
     status = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))["status"]
     if status != "complete":
@@ -2724,8 +2914,8 @@ def cli(argv: Optional[list[str]] = None) -> Optional[Path]:
     with pd.option_context("display.max_columns", 30, "display.width", 250):
         print(display_table(summarize(df, a.fix, a.alpha, a.min_n, a.margin)).to_string(index=False))
     print(f"\nScore check: {agree}/{total} re-scored answers match the stored scores.")
-    spent = json.loads((run_dir / "meta.json").read_text(encoding="utf-8")).get("spent_usd")
-    if spent is not None:
+    if prices:
+        spent = raw_spend(run_dir / "raw.jsonl", prices)
         print(f"Actual spend (from API usage): ${spent:.4f}")
     print(f"Saved to {run_dir}")
     for k, p in paths.items():
